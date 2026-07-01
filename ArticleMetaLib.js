@@ -96,6 +96,22 @@
             const cut = s.slice(0, max);
             const lastSpace = cut.lastIndexOf(' ');
             return lastSpace > 0 ? cut.slice(0, lastSpace) : cut;
+        },
+
+        // Converts an ISO date string (YYYY-MM-DD) to "Month DD, YYYY".
+        // Returns the input unchanged if it doesn't match that shape.
+        formatDateLong(isoDate) {
+            if (!isoDate) return null;
+            const parts = isoDate.split('-');
+            if (parts.length !== 3) return isoDate;
+            const months = [
+                'January', 'February', 'March', 'April', 'May', 'June',
+                'July', 'August', 'September', 'October', 'November', 'December'
+            ];
+            const [y, mo, d] = parts;
+            const idx = parseInt(mo, 10) - 1;
+            if (idx < 0 || idx > 11) return isoDate;
+            return `${months[idx]} ${d}, ${y}`;
         }
     };
 
@@ -467,11 +483,35 @@
         return { source: 'fallback', pageType: 'fallback', date, pub: pub || null, headline: headline || null };
     }
 
+    function getStandardFields() {
+        const author =
+            utils.getMeta('author') ||
+            utils.getMeta('article:author') ||
+            utils.getMeta('twitter:creator') ||
+            utils.getMeta('parsely-author') ||
+            null;
+        const section = utils.getMeta('article:section') || utils.getMeta('parsely-section') || null;
+        const modified = utils.normaliseDate(utils.getMeta('article:modified_time'));
+        return { author, section, modified };
+    }
+
     async function scan(host) {
+        let metadata = null;
+        let matched = false;
+
         for (const { match, handle } of siteHandlers) {
-            if (match(host)) return await handle();
+            if (match(host)) { matched = true; metadata = await handle(); break; }
         }
-        return globalFallback();
+        if (!matched) metadata = globalFallback();
+
+        if (metadata && metadata.pageType !== 'profile') {
+            const std = getStandardFields();
+            if (!metadata.author && std.author) metadata.author = utils.decodeEntities(std.author);
+            if (!metadata.section && std.section) metadata.section = utils.decodeEntities(std.section);
+            if (!metadata.modified && std.modified) metadata.modified = std.modified;
+        }
+
+        return metadata;
     }
 
     window.ArticleMetaLib = { utils, config, scan };
