@@ -4,7 +4,11 @@
 //
 // Exposes window.ArticleMetaLib = { utils, config, scan(host) }.
 // scan() returns a metadata object or null:
-//   { source, pageType, date, pub, headline, author, followers }
+//   { source, pageType, date, utcTime, pub, pubUrl, headline, author, authorUrl,
+//     followers, section, modified, language }
+// utcTime and language are only ever set from unambiguous, standard sources —
+// they stay null rather than guess. Headlines are returned at full length;
+// truncation, if wanted, is a consumer-side display concern.
 // Consumers decide how to format and display this; this file only detects.
 
 (function () {
@@ -65,6 +69,32 @@
                 : el.getAttribute('datetime') || el.textContent.trim();
         },
 
+        // Returns a UTC "HH:MM" string, but only when the raw value is
+        // unambiguous about its instant in time: a unix timestamp, or an
+        // ISO 8601 string with an explicit "Z" or numeric UTC offset. Any
+        // date-only or offset-less string returns null rather than guessing.
+        getUtcTime(raw) {
+            if (!raw) return null;
+            const s = String(raw).trim();
+
+            if (/^\d{9,11}$/.test(s)) {
+                const d = new Date(parseInt(s, 10) * 1000);
+                if (!isNaN(d.getTime()) && d.getFullYear() > 1970) return d.toISOString().slice(11, 16);
+            }
+
+            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})$/i.test(s)) {
+                const d = new Date(s);
+                if (!isNaN(d.getTime())) return d.toISOString().slice(11, 16);
+            }
+
+            return null;
+        },
+
+        // Combines normaliseDate + getUtcTime for a single raw value.
+        extractDateTime(raw) {
+            return { date: this.normaliseDate(raw), utcTime: this.getUtcTime(raw) };
+        },
+
         parseFollowerString(str) {
             if (!str) return null;
             const s = str.replace(/,/g, '').trim();
@@ -112,6 +142,14 @@
             const idx = parseInt(mo, 10) - 1;
             if (idx < 0 || idx > 11) return isoDate;
             return `${months[idx]} ${d}, ${y}`;
+        },
+
+        // True if a string looks like a URL/handle rather than a person's name.
+        // Used to reject meta-tag values (e.g. twitter:creator, article:author)
+        // that sites sometimes populate with a profile link instead of a name.
+        looksLikeUrl(str) {
+            if (!str) return false;
+            return /^https?:\/\//i.test(str) || /^www\./i.test(str) || /\.[a-z]{2,6}\//i.test(str);
         }
     };
 
@@ -140,21 +178,25 @@
                     return 'other';
                 }
 
-                function getDate() {
-                    const meta = utils.normaliseDate(
-                        utils.getMeta('og:updated_time') || utils.getMeta('article:published_time')
-                    );
-                    if (meta) return meta;
+                function getDateInfo() {
+                    const rawMeta = utils.getMeta('og:updated_time') || utils.getMeta('article:published_time');
+                    if (rawMeta) {
+                        const info = utils.extractDateTime(rawMeta);
+                        if (info.date) return info;
+                    }
                     const el = document.querySelector('article time[datetime], main time[datetime], time[datetime]');
-                    if (el) return utils.normaliseDate(el.getAttribute('datetime'));
+                    if (el) {
+                        const info = utils.extractDateTime(el.getAttribute('datetime'));
+                        if (info.date) return info;
+                    }
                     for (const script of document.querySelectorAll('script:not([src])')) {
                         const text = script.textContent;
                         if (!text.includes('taken_at')) continue;
                         let m = text.match(/"taken_at_timestamp"\s*:\s*(\d+)/);
                         if (!m) m = text.match(/"taken_at"\s*:\s*(\d+)/);
-                        if (m) return utils.normaliseDate(m[1]);
+                        if (m) return utils.extractDateTime(m[1]);
                     }
-                    return null;
+                    return { date: null, utcTime: null };
                 }
 
                 function usernameFromOgUrl() {
@@ -281,12 +323,21 @@
                     const username = getUsername();
                     if (!username) return null;
                     const followers = followersFromDesc(utils.getMeta('og:description')) || await fetchFollowers(username);
-                    return { source: 'instagram', pageType: 'profile', author: username, followers, pub: 'Instagram' };
+                    return {
+                        source: 'instagram', pageType: 'profile', author: username, followers,
+                        pub: 'Instagram', pubUrl: 'https://www.instagram.com/',
+                        authorUrl: `https://www.instagram.com/${username}/`
+                    };
                 }
 
-                const date = getDate();
-                if (!date) return null;
-                return { source: 'instagram', pageType, date, pub: 'Instagram', author: getUsername() };
+                const date = getDateInfo();
+                if (!date.date) return null;
+                const username = getUsername();
+                return {
+                    source: 'instagram', pageType, date: date.date, utcTime: date.utcTime, pub: 'Instagram', author: username,
+                    pubUrl: 'https://www.instagram.com/',
+                    authorUrl: username ? `https://www.instagram.com/${username}/` : null
+                };
             }
         },
 
@@ -294,22 +345,44 @@
             match: host => host.includes('facebook.com'),
 
             handle() {
-                let date = utils.normaliseDate(
-                    utils.getMeta('article:published_time') || utils.getMeta('og:updated_time')
-                );
+                let date = null;
+                let utcTime = null;
+
+                const metaRaw = utils.getMeta('article:published_time') || utils.getMeta('og:updated_time');
+                if (metaRaw) {
+                    const info = utils.extractDateTime(metaRaw);
+                    date = info.date;
+                    utcTime = info.utcTime;
+                }
                 if (!date) {
                     for (const script of document.querySelectorAll('script:not([src])')) {
                         const text = script.textContent;
                         if (!text.includes('publish_time') && !text.includes('creation_time')) continue;
                         let m = text.match(/"publish_time"\s*:\s*(\d+)/);
                         if (!m) m = text.match(/"creation_time"\s*:\s*(\d+)/);
-                        if (m) { date = utils.normaliseDate(m[1]); break; }
+                        if (m) {
+                            const info = utils.extractDateTime(m[1]);
+                            date = info.date;
+                            utcTime = info.utcTime;
+                            break;
+                        }
                     }
                 }
                 if (!date) return null;
                 const pub = utils.decodeEntities(utils.getMeta('og:site_name') || 'Facebook');
-                const headline = utils.truncate(utils.decodeEntities(document.title), 60);
-                return { source: 'facebook', pageType: 'post', date, pub, headline };
+                const headline = utils.decodeEntities(document.title);
+
+                const ignoredSlugs = new Set(['permalink.php', 'watch', 'groups', 'photo.php', 'story.php', 'events']);
+                let pubUrl = null;
+                const ogUrl = utils.getMeta('og:url');
+                if (ogUrl) {
+                    try {
+                        const slug = new URL(ogUrl).pathname.split('/').filter(Boolean)[0];
+                        if (slug && !ignoredSlugs.has(slug)) pubUrl = `https://www.facebook.com/${slug}`;
+                    } catch {}
+                }
+
+                return { source: 'facebook', pageType: 'post', date, utcTime, pub, headline, pubUrl };
             }
         },
 
@@ -317,10 +390,11 @@
             match: host => host.includes('nytimes.com'),
 
             handle() {
-                const date = utils.normaliseDate(utils.getMeta('article:published_time'));
+                const raw = utils.getMeta('article:published_time');
+                const { date, utcTime } = utils.extractDateTime(raw);
                 if (!date) return null;
-                const headline = utils.truncate(utils.decodeEntities(utils.getMeta('og:title') || document.title), 60);
-                return { source: 'nytimes', pageType: 'article', date, pub: 'NYT', headline };
+                const headline = utils.decodeEntities(utils.getMeta('og:title') || document.title);
+                return { source: 'nytimes', pageType: 'article', date, utcTime, pub: 'NYT', headline, pubUrl: 'https://www.nytimes.com' };
             }
         },
 
@@ -328,12 +402,11 @@
             match: host => host.includes('bloomberg.com'),
 
             handle() {
-                const date = utils.normaliseDate(
-                    utils.getMeta('datePublished') || utils.getMeta('article:published_time')
-                );
+                const raw = utils.getMeta('datePublished') || utils.getMeta('article:published_time');
+                const { date, utcTime } = utils.extractDateTime(raw);
                 if (!date) return null;
-                const headline = utils.truncate(utils.decodeEntities(utils.getMeta('og:title') || document.title), 60);
-                return { source: 'bloomberg', pageType: 'article', date, pub: 'Bloomberg', headline };
+                const headline = utils.decodeEntities(utils.getMeta('og:title') || document.title);
+                return { source: 'bloomberg', pageType: 'article', date, utcTime, pub: 'Bloomberg', headline, pubUrl: 'https://www.bloomberg.com' };
             }
         },
 
@@ -363,15 +436,23 @@
                     return m ? m[1] : null;
                 }
 
-                function getDate() {
+                function getDateInfo() {
                     for (const script of document.querySelectorAll('script#__UNIVERSAL_DATA_FOR_REHYDRATION__')) {
                         try {
                             const data = JSON.parse(script.textContent);
                             const videoDetail = data?.['__DEFAULT_SCOPE__']?.['webapp.video-detail']?.itemInfo?.itemStruct;
-                            if (videoDetail?.createTime) return utils.normaliseDate(String(videoDetail.createTime));
+                            if (videoDetail?.createTime) return utils.extractDateTime(String(videoDetail.createTime));
                         } catch {}
                     }
-                    return utils.normaliseDate(utils.getMeta('og:updated_time') || utils.getMeta('article:published_time'));
+                    for (const script of document.querySelectorAll('script#SIGI_STATE')) {
+                        try {
+                            const data = JSON.parse(script.textContent);
+                            const items = data?.ItemModule ? Object.values(data.ItemModule) : [];
+                            if (items[0]?.createTime) return utils.extractDateTime(String(items[0].createTime));
+                        } catch {}
+                    }
+                    const rawMeta = utils.getMeta('og:updated_time') || utils.getMeta('article:published_time') || utils.getMeta('og:video:release_date');
+                    return utils.extractDateTime(rawMeta);
                 }
 
                 function followersFromDesc(desc) {
@@ -386,12 +467,21 @@
                     const username = getUsername();
                     if (!username) return null;
                     const followers = followersFromDesc(utils.getMeta('og:description'));
-                    return { source: 'tiktok', pageType: 'profile', author: username, followers, pub: 'TikTok' };
+                    return {
+                        source: 'tiktok', pageType: 'profile', author: username, followers,
+                        pub: 'TikTok', pubUrl: 'https://www.tiktok.com/',
+                        authorUrl: `https://www.tiktok.com/@${username}`
+                    };
                 }
 
-                const date = getDate();
-                if (!date) return null;
-                return { source: 'tiktok', pageType, date, pub: 'TikTok', author: getUsername() };
+                const date = getDateInfo();
+                if (!date.date && pageType !== 'video') return null;
+                const username = getUsername();
+                return {
+                    source: 'tiktok', pageType, date: date.date, utcTime: date.utcTime, pub: 'TikTok', author: username,
+                    pubUrl: 'https://www.tiktok.com/',
+                    authorUrl: username ? `https://www.tiktok.com/@${username}` : null
+                };
             }
         },
 
@@ -409,15 +499,21 @@
                 const archiveDate = `${archiveTs.slice(0,4)}-${archiveTs.slice(4,6)}-${archiveTs.slice(6,8)}`;
                 const isException = articleExceptions.some(d => originalDomain?.includes(d));
 
-                function getPubDate() {
-                    return utils.normaliseDate(
+                function getPubDateInfo() {
+                    const rawMeta =
                         utils.getMeta('article:published_time') || utils.getMeta('og:updated_time') ||
                         utils.getMeta('publish-date') || utils.getMeta('pubdate') ||
-                        utils.getMeta('date') || utils.getMeta('datePublished')
-                    ) || (() => {
-                        const el = document.querySelector('time[datetime]');
-                        return el ? utils.normaliseDate(el.getAttribute('datetime')) : null;
-                    })();
+                        utils.getMeta('date') || utils.getMeta('datePublished');
+                    if (rawMeta) {
+                        const info = utils.extractDateTime(rawMeta);
+                        if (info.date) return info;
+                    }
+                    const el = document.querySelector('time[datetime]');
+                    if (el) {
+                        const info = utils.extractDateTime(el.getAttribute('datetime'));
+                        if (info.date) return info;
+                    }
+                    return { date: null, utcTime: null };
                 }
 
                 if (originalDomain?.includes('instagram.com')) {
@@ -430,7 +526,13 @@
                     } catch {}
                     if (!username && parts.length >= 2 && !igReserved.has(parts[0])) username = parts[0];
                     if (username) {
-                        return { source: 'webarchive', subtype: 'instagram', date: getPubDate() || archiveDate, pub: 'Instagram (archived)', author: username };
+                        const pd = getPubDateInfo();
+                        return {
+                            source: 'webarchive', subtype: 'instagram',
+                            date: pd.date || archiveDate, utcTime: pd.date ? pd.utcTime : null,
+                            pub: 'Instagram (archived)', pubUrl: 'https://www.instagram.com/',
+                            author: username, authorUrl: `https://www.instagram.com/${username}/`
+                        };
                     }
                 }
 
@@ -438,27 +540,39 @@
                     const parts = originalPath.split('/').filter(Boolean);
                     const username = parts[0]?.startsWith('@') ? parts[0].slice(1) : null;
                     if (username) {
-                        return { source: 'webarchive', subtype: 'tiktok', date: getPubDate() || archiveDate, pub: 'TikTok (archived)', author: username };
+                        const pd = getPubDateInfo();
+                        return {
+                            source: 'webarchive', subtype: 'tiktok',
+                            date: pd.date || archiveDate, utcTime: pd.date ? pd.utcTime : null,
+                            pub: 'TikTok (archived)', pubUrl: 'https://www.tiktok.com/',
+                            author: username, authorUrl: `https://www.tiktok.com/@${username}`
+                        };
                     }
                 }
 
                 if (originalDomain?.includes('facebook.com')) {
                     const siteName = utils.decodeEntities(utils.getMeta('og:site_name') || 'Facebook');
-                    const headline = utils.truncate(utils.decodeEntities(document.title), 60);
-                    return { source: 'webarchive', subtype: 'facebook', date: getPubDate() || archiveDate, pub: siteName, headline };
+                    const headline = utils.decodeEntities(document.title);
+                    const ignoredSlugs = new Set(['permalink.php', 'watch', 'groups', 'photo.php', 'story.php', 'events']);
+                    const slug = originalPath.split('/').filter(Boolean)[0];
+                    const pubUrl = slug && !ignoredSlugs.has(slug) ? `https://www.facebook.com/${slug}` : null;
+                    const pd = getPubDateInfo();
+                    return {
+                        source: 'webarchive', subtype: 'facebook',
+                        date: pd.date || archiveDate, utcTime: pd.date ? pd.utcTime : null,
+                        pub: siteName, headline, pubUrl
+                    };
                 }
 
                 const pub = utils.decodeEntities(utils.getMeta('og:site_name'));
-                const pubDate = getPubDate();
-                if (!isException && pub && pubDate) {
-                    const headline = utils.truncate(
-                        utils.decodeEntities(utils.getMeta('og:title') || utils.getMeta('twitter:title') || document.title),
-                        60
-                    );
-                    return { source: 'webarchive', subtype: 'article', date: pubDate, pub, headline };
+                const pd = getPubDateInfo();
+                if (!isException && pub && pd.date) {
+                    const headline = utils.decodeEntities(utils.getMeta('og:title') || utils.getMeta('twitter:title') || document.title);
+                    const pubUrl = originalDomain ? `https://${originalDomain}` : null;
+                    return { source: 'webarchive', subtype: 'article', date: pd.date, utcTime: pd.utcTime, pub, headline, pubUrl };
                 }
 
-                const titleFallback = utils.truncate(utils.decodeEntities(document.title), 60);
+                const titleFallback = utils.decodeEntities(document.title);
                 return { source: 'webarchive', subtype: 'fallback', date: archiveDate, headline: titleFallback };
             }
         }
@@ -467,32 +581,79 @@
 
     function globalFallback() {
         let date = null;
+        let utcTime = null;
         for (const selector of config.globalDateSelectors) {
             const el = document.querySelector(selector);
             if (!el) continue;
-            date = utils.normaliseDate(utils.getRawDateString(el));
-            if (date) break;
+            const info = utils.extractDateTime(utils.getRawDateString(el));
+            if (info.date) { date = info.date; utcTime = info.utcTime; break; }
         }
         if (!date) return null;
 
         const pub = utils.decodeEntities(utils.getMeta('og:site_name'));
-        const headline = utils.truncate(
-            utils.decodeEntities(utils.getMeta('og:title') || utils.getMeta('twitter:title') || ''),
-            60
-        );
-        return { source: 'fallback', pageType: 'fallback', date, pub: pub || null, headline: headline || null };
+        const headline = utils.decodeEntities(utils.getMeta('og:title') || utils.getMeta('twitter:title') || '');
+        return {
+            source: 'fallback', pageType: 'fallback', date, utcTime, pub: pub || null, headline: headline || null,
+            pubUrl: pub ? `${window.location.protocol}//${window.location.hostname}` : null
+        };
+    }
+
+    // Searches page-wide JSON-LD (schema.org Article/NewsArticle/BlogPosting)
+    // for an author name — the most structured, least ambiguous source
+    // available. Author objects sometimes carry a "url" to a bio page too.
+    function authorFromJsonLd() {
+        for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+            try {
+                const data = JSON.parse(script.textContent);
+                const entries = Array.isArray(data) ? data : (Array.isArray(data['@graph']) ? data['@graph'] : [data]);
+                for (const entry of entries) {
+                    let author = entry.author;
+                    if (!author) continue;
+                    if (Array.isArray(author)) author = author[0];
+                    const name = typeof author === 'string' ? author : author.name;
+                    if (!name || utils.looksLikeUrl(name)) continue;
+                    const url = (typeof author === 'object' && author.url && /^https?:\/\//i.test(author.url))
+                        ? author.url : null;
+                    return { name, url };
+                }
+            } catch {}
+        }
+        return null;
+    }
+
+    // Meta tags are a lower-confidence fallback: only used when JSON-LD has
+    // nothing, and rejected outright if the value looks like a URL/handle
+    // rather than a name (sites frequently misuse these fields that way).
+    // High-confidence only: the author-declared html[lang] attribute is the
+    // standard, explicit way a page states its language — no inference.
+    // og:locale is the equivalent fallback for the same reason. Anything
+    // that doesn't look like a real language/locale code is rejected.
+    function getLanguage() {
+        const codePattern = /^[a-zA-Z]{2}([-_][a-zA-Z0-9]{2,8})?$/;
+
+        const htmlLang = document.documentElement.getAttribute('lang');
+        if (htmlLang && codePattern.test(htmlLang.trim())) return htmlLang.trim();
+
+        const ogLocale = utils.getMeta('og:locale');
+        if (ogLocale && codePattern.test(ogLocale.trim())) return ogLocale.trim().replace('_', '-');
+
+        return null;
     }
 
     function getStandardFields() {
-        const author =
-            utils.getMeta('author') ||
-            utils.getMeta('article:author') ||
-            utils.getMeta('twitter:creator') ||
-            utils.getMeta('parsely-author') ||
-            null;
+        const jsonLd = authorFromJsonLd();
+        let author = jsonLd?.name || null;
+        let authorUrl = jsonLd?.url || null;
+
+        if (!author) {
+            const candidate = utils.getMeta('author') || utils.getMeta('article:author');
+            if (candidate && !utils.looksLikeUrl(candidate)) author = candidate;
+        }
+
         const section = utils.getMeta('article:section') || utils.getMeta('parsely-section') || null;
         const modified = utils.normaliseDate(utils.getMeta('article:modified_time'));
-        return { author, section, modified };
+        const language = getLanguage();
+        return { author, authorUrl, section, modified, language };
     }
 
     async function scan(host) {
@@ -507,8 +668,10 @@
         if (metadata && metadata.pageType !== 'profile') {
             const std = getStandardFields();
             if (!metadata.author && std.author) metadata.author = utils.decodeEntities(std.author);
+            if (!metadata.authorUrl && std.authorUrl) metadata.authorUrl = std.authorUrl;
             if (!metadata.section && std.section) metadata.section = utils.decodeEntities(std.section);
             if (!metadata.modified && std.modified) metadata.modified = std.modified;
+            if (!metadata.language && std.language) metadata.language = std.language;
         }
 
         return metadata;
