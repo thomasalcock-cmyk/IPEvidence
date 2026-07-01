@@ -1,15 +1,11 @@
 // Shared detection library for CustomTabTitles / ArticleMetadataBanner.
-// Not a standalone userscript — host this file (GitHub raw / jsDelivr) and
-// pull it in via @require from each consumer script.
-//
-// Exposes window.ArticleMetaLib = { utils, config, scan(host) }.
-// scan() returns a metadata object or null:
+// Host this file and pull it in via @require from each consumer script.
+// window.ArticleMetaLib = { utils, config, scan(host), resetCleanTitle }
+// scan() returns null or:
 //   { source, pageType, date, utcTime, pub, pubUrl, headline, author, authorUrl,
 //     followers, section, modified, language }
-// utcTime and language are only ever set from unambiguous, standard sources —
-// they stay null rather than guess. Headlines are returned at full length;
-// truncation, if wanted, is a consumer-side display concern.
-// Consumers decide how to format and display this; this file only detects.
+// utcTime/language only ever come from unambiguous sources. Headlines are
+// returned at full length; truncation is a consumer-side concern.
 
 (function () {
     'use strict';
@@ -26,6 +22,19 @@
             'time'
         ]
     };
+
+    // Snapshot of document.title before CustomTabTitles can overwrite it.
+    // Captured on first use per page-view; reset on SPA navigation.
+    let cleanTitle = null;
+
+    function getCleanTitle() {
+        if (cleanTitle === null) cleanTitle = document.title;
+        return cleanTitle;
+    }
+
+    function resetCleanTitle() {
+        cleanTitle = null;
+    }
 
     const utils = {
         getMeta(key) {
@@ -69,10 +78,8 @@
                 : el.getAttribute('datetime') || el.textContent.trim();
         },
 
-        // Returns a UTC "HH:MM" string, but only when the raw value is
-        // unambiguous about its instant in time: a unix timestamp, or an
-        // ISO 8601 string with an explicit "Z" or numeric UTC offset. Any
-        // date-only or offset-less string returns null rather than guessing.
+        // UTC "HH:MM", only when unambiguous: unix timestamp or ISO 8601
+        // with explicit Z/offset. Returns null rather than guessing.
         getUtcTime(raw) {
             if (!raw) return null;
             const s = String(raw).trim();
@@ -90,7 +97,6 @@
             return null;
         },
 
-        // Combines normaliseDate + getUtcTime for a single raw value.
         extractDateTime(raw) {
             return { date: this.normaliseDate(raw), utcTime: this.getUtcTime(raw) };
         },
@@ -128,8 +134,7 @@
             return lastSpace > 0 ? cut.slice(0, lastSpace) : cut;
         },
 
-        // Converts an ISO date string (YYYY-MM-DD) to "Month DD, YYYY".
-        // Returns the input unchanged if it doesn't match that shape.
+        // YYYY-MM-DD to "Month DD, YYYY". Unchanged if input doesn't match.
         formatDateLong(isoDate) {
             if (!isoDate) return null;
             const parts = isoDate.split('-');
@@ -144,20 +149,14 @@
             return `${months[idx]} ${d}, ${y}`;
         },
 
-        // True if a string looks like a URL/handle rather than a person's name.
-        // Used to reject meta-tag values (e.g. twitter:creator, article:author)
-        // that sites sometimes populate with a profile link instead of a name.
+        // Rejects meta-tag values that are a URL/handle rather than a name.
         looksLikeUrl(str) {
             if (!str) return false;
             return /^https?:\/\//i.test(str) || /^www\./i.test(str) || /\.[a-z]{2,6}\//i.test(str);
         }
     };
 
-    // =========================================================================
-    // SITE HANDLERS
-    // Each: { match(host) => bool, handle() => metadata | Promise<metadata> | null }
-    // =========================================================================
-
+    // { match(host) => bool, handle() => metadata | Promise<metadata> | null }
     const siteHandlers = [
 
         {
@@ -285,7 +284,7 @@
                 }
 
                 function usernameFromTitle() {
-                    const m = document.title.match(/@([\w._]+)/);
+                    const m = getCleanTitle().match(/@([\w._]+)/);
                     return m ? m[1] : null;
                 }
 
@@ -370,7 +369,7 @@
                 }
                 if (!date) return null;
                 const pub = utils.decodeEntities(utils.getMeta('og:site_name') || 'Facebook');
-                const headline = utils.decodeEntities(document.title);
+                const headline = utils.decodeEntities(getCleanTitle());
 
                 const ignoredSlugs = new Set(['permalink.php', 'watch', 'groups', 'photo.php', 'story.php', 'events']);
                 let pubUrl = null;
@@ -393,7 +392,7 @@
                 const raw = utils.getMeta('article:published_time');
                 const { date, utcTime } = utils.extractDateTime(raw);
                 if (!date) return null;
-                const headline = utils.decodeEntities(utils.getMeta('og:title') || document.title);
+                const headline = utils.decodeEntities(utils.getMeta('og:title') || getCleanTitle());
                 return { source: 'nytimes', pageType: 'article', date, utcTime, pub: 'NYT', headline, pubUrl: 'https://www.nytimes.com' };
             }
         },
@@ -405,7 +404,7 @@
                 const raw = utils.getMeta('datePublished') || utils.getMeta('article:published_time');
                 const { date, utcTime } = utils.extractDateTime(raw);
                 if (!date) return null;
-                const headline = utils.decodeEntities(utils.getMeta('og:title') || document.title);
+                const headline = utils.decodeEntities(utils.getMeta('og:title') || getCleanTitle());
                 return { source: 'bloomberg', pageType: 'article', date, utcTime, pub: 'Bloomberg', headline, pubUrl: 'https://www.bloomberg.com' };
             }
         },
@@ -552,7 +551,7 @@
 
                 if (originalDomain?.includes('facebook.com')) {
                     const siteName = utils.decodeEntities(utils.getMeta('og:site_name') || 'Facebook');
-                    const headline = utils.decodeEntities(document.title);
+                    const headline = utils.decodeEntities(getCleanTitle());
                     const ignoredSlugs = new Set(['permalink.php', 'watch', 'groups', 'photo.php', 'story.php', 'events']);
                     const slug = originalPath.split('/').filter(Boolean)[0];
                     const pubUrl = slug && !ignoredSlugs.has(slug) ? `https://www.facebook.com/${slug}` : null;
@@ -567,12 +566,12 @@
                 const pub = utils.decodeEntities(utils.getMeta('og:site_name'));
                 const pd = getPubDateInfo();
                 if (!isException && pub && pd.date) {
-                    const headline = utils.decodeEntities(utils.getMeta('og:title') || utils.getMeta('twitter:title') || document.title);
+                    const headline = utils.decodeEntities(utils.getMeta('og:title') || utils.getMeta('twitter:title') || getCleanTitle());
                     const pubUrl = originalDomain ? `https://${originalDomain}` : null;
                     return { source: 'webarchive', subtype: 'article', date: pd.date, utcTime: pd.utcTime, pub, headline, pubUrl };
                 }
 
-                const titleFallback = utils.decodeEntities(document.title);
+                const titleFallback = utils.decodeEntities(getCleanTitle());
                 return { source: 'webarchive', subtype: 'fallback', date: archiveDate, headline: titleFallback };
             }
         }
@@ -598,9 +597,7 @@
         };
     }
 
-    // Searches page-wide JSON-LD (schema.org Article/NewsArticle/BlogPosting)
-    // for an author name — the most structured, least ambiguous source
-    // available. Author objects sometimes carry a "url" to a bio page too.
+    // Most reliable author source: page-wide JSON-LD (schema.org Article etc).
     function authorFromJsonLd() {
         for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
             try {
@@ -621,13 +618,7 @@
         return null;
     }
 
-    // Meta tags are a lower-confidence fallback: only used when JSON-LD has
-    // nothing, and rejected outright if the value looks like a URL/handle
-    // rather than a name (sites frequently misuse these fields that way).
-    // High-confidence only: the author-declared html[lang] attribute is the
-    // standard, explicit way a page states its language — no inference.
-    // og:locale is the equivalent fallback for the same reason. Anything
-    // that doesn't look like a real language/locale code is rejected.
+    // html[lang] / og:locale only — explicit, author-declared, no inference.
     function getLanguage() {
         const codePattern = /^[a-zA-Z]{2}([-_][a-zA-Z0-9]{2,8})?$/;
 
@@ -677,6 +668,6 @@
         return metadata;
     }
 
-    window.ArticleMetaLib = { utils, config, scan };
+    window.ArticleMetaLib = { utils, config, scan, resetCleanTitle };
 
 })();
